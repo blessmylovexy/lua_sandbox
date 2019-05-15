@@ -1,0 +1,562 @@
+%{
+/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* vim: set ts=2 et sw=2 tw=80: */
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+/** @brief Hindsight message matcher parser @file */
+
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include "heka_message_matcher_impl.h"
+#include "luasandbox/util/heka_message.h"
+#include "luasandbox/util/heka_message_matcher.h"
+
+#ifndef _MSC_VER
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#else
+#pragma warning( disable : 4267 4244 )
+#endif
+
+typedef struct match_node_tmp {
+  uint8_t id;
+  uint8_t op;
+  uint8_t val_mod;
+  uint8_t val_type;
+  uint8_t val_len;
+  uint8_t var_len;
+  uint8_t fi; // left node index for logical op
+  uint8_t ai; // right node index for logical op
+  char          *var;
+
+  union {
+    char    *s;
+    double  d;
+  } val;
+} match_node_tmp;
+
+
+typedef struct match_node_array {
+  match_node_tmp *a;
+  int            pos;
+  int            size;
+} match_node_array;
+
+
+typedef struct input_string {
+  const char *s;
+  size_t     pos;
+  size_t     size;
+} input_string;
+
+
+typedef struct context {
+  match_node_array  out;
+  match_node_array  ops;
+  match_node_tmp    mn;
+  struct tm         tms;
+  int               cond_cnt;
+  input_string      is;
+} context;
+
+
+#define YY_PARSE(T) static T
+#define YY_CTX_LOCAL 1
+#define YY_CTX_MEMBERS \
+   context ctx;
+
+#define YY_INPUT(yy, buf, result, max_size)                                    \
+{                                                                              \
+  input_string *is = &yy->ctx.is;                                              \
+  result = is->size - is->pos;                                                 \
+  if (result > 0) {                                                            \
+    if (max_size >= result) {                                                  \
+      memcpy(buf, &is->s[is->pos], result);                                    \
+      is->pos += result;                                                       \
+    } else {                                                                   \
+      memcpy(buf, &is->s[is->pos], max_size);                                  \
+      is->pos += max_size;                                                     \
+      result = max_size;                                                       \
+    }                                                                          \
+  }                                                                            \
+}
+
+
+static void init_match_node(match_node_tmp *mn)
+{
+  memset(mn, 0, sizeof(match_node_tmp));
+}
+
+
+static void move_match_node(match_node_tmp *dest, match_node_tmp *src)
+{
+  memcpy(dest, src, sizeof(match_node_tmp));
+  init_match_node(src); // dest now owns the memory, wipe the pointers
+}
+
+
+static void realloc_mna(match_node_array *mna)
+{
+  size_t bytes = sizeof(match_node_tmp) * ++mna->size;
+  match_node_tmp *tmp = realloc(mna->a, bytes);
+  if (tmp) {
+    mna->a = tmp;
+    init_match_node(&mna->a[mna->size - 1]);
+  } else {
+    fprintf(stderr, "realloc failed\n");
+    exit(1);
+  }
+}
+
+
+static void push_output(context *ctx, match_node_tmp *mn)
+{
+  if (!ctx->out.a || ctx->out.pos == ctx->out.size) {
+    realloc_mna(&ctx->out);
+  }
+  move_match_node(&ctx->out.a[ctx->out.pos++], mn);
+}
+
+
+static void push_op(context *ctx, match_operation op)
+{
+  if (!ctx->ops.a) {
+    realloc_mna(&ctx->ops);
+    ctx->ops.a[ctx->ops.pos++].op = op;
+    return;
+  }
+
+  if (op == OP_OPEN || op > ctx->ops.a[ctx->ops.pos - 1].op) {
+    if (ctx->ops.pos == ctx->ops.size) {
+      realloc_mna(&ctx->ops);
+    }
+    ctx->ops.a[ctx->ops.pos++].op = op;
+  } else {
+    push_output(ctx, &ctx->ops.a[ctx->ops.pos - 1]);
+    ctx->ops.a[ctx->ops.pos - 1].op = op;
+  }
+}
+
+
+static void pop_to_paren(context *ctx)
+{
+  for (; ctx->ops.pos > 0; --ctx->ops.pos) {
+    match_node_tmp *op = &ctx->ops.a[ctx->ops.pos - 1];
+    if (op->op == OP_OPEN) break;
+    push_output(ctx, op);
+  }
+}
+
+
+static void pop_all_ops(context *ctx)
+{
+  for (; ctx->ops.pos > 0; --ctx->ops.pos) {
+    match_node_tmp *op = &ctx->ops.a[ctx->ops.pos - 1];
+    if (op->op == OP_OPEN) continue;
+    push_output(ctx, op);
+  }
+}
+
+
+static void update_date(context *ctx, int year, int mon, int day)
+{
+  ctx->tms.tm_isdst = -1;
+  ctx->tms.tm_year  = year - 1900;
+  ctx->tms.tm_mon   = mon - 1;
+  ctx->tms.tm_mday  = day;
+}
+
+
+static void update_time(context *ctx, int hour, int minute, int sec)
+{
+  ctx->tms.tm_hour  = hour;
+  ctx->tms.tm_min   = minute;
+  ctx->tms.tm_sec   = sec;
+}
+
+
+static void update_offset(context *ctx, char sign, int hour, int minute)
+{
+  ctx->mn.val.d += (hour * 3600 + minute * 60) * (sign == '-' ? -1 : 1);
+}
+
+
+static void set_field(context *ctx, char *name)
+{
+  ctx->mn.id = LSB_PB_FIELDS;
+  ctx->mn.var_len = strlen(name);
+  ctx->mn.var = malloc(ctx->mn.var_len + 1);
+  if (!ctx->mn.var) {
+    fprintf(stderr, "malloc failed\n");
+    exit(1);
+  }
+  memcpy(ctx->mn.var, name, ctx->mn.var_len + 1);
+}
+
+
+static void set_timestamp(context *ctx)
+{
+  ctx->mn.id = LSB_PB_TIMESTAMP;
+  ctx->mn.val_type = TYPE_NUMERIC;
+  if (ctx->tms.tm_isdst == -1) {
+    ctx->mn.val.d += mktime(&ctx->tms);
+    ctx->mn.val.d *= 1e9;
+  }
+  memset(&ctx->tms, 0, sizeof(struct tm));
+}
+
+
+static void set_numeric_value(context *ctx, char *s)
+{
+  ctx->mn.val_type = TYPE_NUMERIC;
+  ctx->mn.val.d = strtod(s, NULL);
+}
+
+
+static void set_string_value(context *ctx, char *s)
+{
+  ctx->mn.val_type = TYPE_STRING;
+  int i, j;
+  for (i = 0, j = 0; s[i]; ++i, ++j) {
+    if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\'')) {
+      ++i;
+    }
+    s[j] = s[i];
+  }
+  s[j] = 0;
+
+  ctx->mn.val_len = j;
+  ctx->mn.val.s = malloc(j + 1);
+  if (!ctx->mn.val.s) {
+    fprintf(stderr, "malloc failed\n");
+    exit(1);
+  }
+  memcpy(ctx->mn.val.s, s, j + 1);
+}
+
+
+static void set_match_mod(context *ctx)
+{
+  if (ctx->mn.val_mod == PATTERN_MOD_NONE
+     && strpbrk(ctx->mn.val.s, "^$*+?.[%-") == NULL) { // literal
+    ctx->mn.val_mod = PATTERN_MOD_ESC;
+  }
+}
+
+
+static bool check_string_len(char *s)
+{
+  int i, j;
+  for (i = 0, j = 0; s[i]; ++i, ++j) {
+    if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\'')) {
+      ++i;
+    }
+  }
+  return (j > UCHAR_MAX) ? false : true;
+}
+
+
+static int cond_cnt(context *ctx)
+{
+  return (++ctx->cond_cnt * 2 + 1 > UCHAR_MAX) ? 0 : 1;
+}
+
+%}
+
+match = sp ored eol {pop_all_ops(&yy->ctx)}
+ored  = anded (or anded)* sp
+anded = expr (and expr)* sp
+expr  = test | open ored close
+test  = ( uuid
+        | timestamp
+        | optional_string_headers
+        | severity
+        | pid
+        | field_test
+        | boolean_test
+        ) {push_output(&yy->ctx, &yy->ctx.mn)} sp
+
+op_eq  = "==" sp {yy->ctx.mn.op = OP_EQ}
+op_ne  = "!=" sp {yy->ctx.mn.op = OP_NE}
+op_seq = "=~" sp {yy->ctx.mn.op = OP_RE}
+op_sne = "!~" sp {yy->ctx.mn.op = OP_NRE}
+op_gte = ">=" sp {yy->ctx.mn.op = OP_GTE}
+op_gt  = ">"  sp {yy->ctx.mn.op = OP_GT}
+op_lte = "<=" sp {yy->ctx.mn.op = OP_LTE}
+op_lt  = "<"  sp {yy->ctx.mn.op = OP_LT}
+
+relational  = op_eq
+            | op_ne
+            | op_gte
+            | op_gt
+            | op_lte
+            | op_lt
+
+boolean_test  = true  {yy->ctx.mn.op = OP_TRUE}
+              | false {yy->ctx.mn.op = OP_FALSE}
+boolean       = true  {yy->ctx.mn.val_type = TYPE_TRUE}
+              | false {yy->ctx.mn.val_type = TYPE_FALSE}
+
+and         = "&&" &{cond_cnt(&yy->ctx)} {push_op(&yy->ctx, OP_AND)}  sp
+or          = "||" &{cond_cnt(&yy->ctx)} {push_op(&yy->ctx, OP_OR)}   sp
+open        = '('  {push_op(&yy->ctx, OP_OPEN)}                       sp
+close       = ')'  {pop_to_paren(&yy->ctx)}                           sp
+
+optional_string_headers = string_headers sp (relational sp string_value | string_match | (op_eq | op_ne) sp nil)
+
+uuid            = "Uuid"        {yy->ctx.mn.id = LSB_PB_UUID} sp (relational sp string_value | string_match)
+string_headers  = "Type"        {yy->ctx.mn.id = LSB_PB_TYPE}
+                | "Logger"      {yy->ctx.mn.id = LSB_PB_LOGGER}
+                | "Hostname"    {yy->ctx.mn.id = LSB_PB_HOSTNAME}
+                | "EnvVersion"  {yy->ctx.mn.id = LSB_PB_ENV_VERSION}
+                | "Payload"     {yy->ctx.mn.id = LSB_PB_PAYLOAD}
+
+string_value = ( '"' < ('\\\"' | (!'"' .))* > '"'
+               | "'" < ("\\\'" | (!"'" .))* > "'"
+               ) &{check_string_len(yytext)} {set_string_value(&yy->ctx, yytext)}
+
+string_match = (op_seq | op_sne) sp string_value string_match_mod? {set_match_mod(&yy->ctx)}
+
+string_match_mod = "%" {yy->ctx.mn.val_mod = PATTERN_MOD_ESC}
+
+severity = "Severity"  {yy->ctx.mn.id = LSB_PB_SEVERITY} sp relational sp numeric_value
+pid      = "Pid"       {yy->ctx.mn.id = LSB_PB_PID} sp (relational sp numeric_value | (op_eq | op_ne) sp nil)
+
+numeric_value = < sign? number decimal? exponent? > {set_numeric_value(&yy->ctx, yytext)}
+sign          = [-+]
+number        = "0"
+              | [1-9] [0-9]*
+decimal       = "." [0-9]+
+exponent      = [eE] sign? [0-9]+
+
+field_test  = fields sp ((relational sp (string_value | numeric_value))
+            | string_match
+            | (op_eq | op_ne) sp (boolean | nil))
+fields      = "Fields[" < [^\]]* > "]" {set_field(&yy->ctx, yytext)} f:index? {yy->ctx.mn.fi = f} a:index? {yy->ctx.mn.ai = a}
+index       = "[" < zero_to_255 > "]" {$$ = atoi(yytext)}
+zero_to_255 = "2" [0-5] [0-5]
+            | "1" [0-9] [0-9]
+            | [1-9] [0-9]
+            | [0-9]
+
+timestamp = ("Timestamp" sp relational sp (numeric_value | ts_quoted)) {set_timestamp(&yy->ctx)}
+ts_quoted = '"' rfc3339 '"' | "'" rfc3339 "'"
+fulldate  = (y:year "-" m:month "-" d:day) {update_date(&yy->ctx, y, m, d)}
+year      = < [0-9] [0-9] [0-9] [0-9] > {$$ = atoi(yytext)}
+month     = ( < "0" [1-9] >
+            | < "1" [0-2] >
+            ) {$$ = atoi(yytext)}
+day       = (
+              < [1-2] [0-9] >
+            | < "0" [1-9] >
+            | < "3" [0-1] >
+            ) {$$ = atoi(yytext)}
+
+rfc3339     = fulldate "T" fulltime
+fulltime    = partialtime timeoffset
+partialtime = h:hour ":" m:minute ":" s:second second_frac? {update_time(&yy->ctx, h, m, s)}
+timeoffset  = "Z" {update_offset(&yy->ctx, '+', 0, 0)}
+            | < sign > h:hour m:minute {update_offset(&yy->ctx, yytext[0], h, m)}
+hour        = (
+                < [0-1] [0-9] >
+              | < "2" [0-3] >
+              ) {$$ = atoi(yytext)}
+minute      = < [0-5] [0-9] > {$$ = atoi(yytext)}
+second      = (
+                < [0-5] [0-9] >
+              | < "60" >
+              ) {$$ = atoi(yytext)}
+second_frac = < decimal > {yy->ctx.mn.val.d += strtod(yytext, NULL)}
+
+nil       = "NIL" {yy->ctx.mn.val_type = TYPE_NIL} sp
+true      = "TRUE" sp
+false     = "FALSE" sp
+sp        = [ \t]*
+eol       = !.
+
+%%
+
+static match_node* copy_node(unsigned char parent, match_node *mn,
+                             match_node_tmp *mnt)
+{
+  mn->op        = mnt->op;
+  mn->val_len   = 0;
+  mn->var_len   = 0;
+  mn->field_id  = mnt->id;
+  mn->val_mod   = mnt->val_mod;
+  mn->val_type  = mnt->val_type;
+
+  if (mn->op == OP_AND || mn->op == OP_OR) {
+    mn->u.off = parent;
+  } else {
+    mn->u.idx.f = mnt->fi;
+    mn->u.idx.a = mnt->ai;
+  }
+
+  if (mnt->id == LSB_PB_FIELDS) {
+    mn->var_len = mnt->var_len;
+  }
+  if (mn->var_len) {
+    memcpy(mn->data, mnt->var, mn->var_len); // no NUL terminator
+    free(mnt->var);
+    mnt->var = NULL;
+    mnt->var_len = 0;
+  }
+
+  size_t val_len = 0;
+  switch (mnt->val_type) {
+  case TYPE_STRING:
+    val_len = mnt->val_len + 1;
+    memcpy(mn->data + mn->var_len, mnt->val.s, val_len);
+    free(mnt->val.s);
+    mnt->val.s = NULL;
+    mnt->val_len = 0;
+    break;
+  case TYPE_NUMERIC:
+    val_len = sizeof(double);
+    memcpy(mn->data + mn->var_len, &mnt->val.d, val_len);
+    break;
+  default:
+    break;
+  }
+
+  mn->units = 1 + ((sizeof(match_node) - 1 + mn->var_len + val_len)
+                   / sizeof(match_node));
+  if (val_len && mnt->val_type == TYPE_STRING) {
+    mn->val_len = val_len - 1;
+  } else {
+    mn->val_len = val_len;
+  }
+  return mn + mn->units;
+}
+
+
+static match_node* inorder_traverse(unsigned char parent, match_node **offsets,
+                                    match_node *mn, match_node_tmp *root,
+                                    match_node_tmp *mnt)
+{
+  if (mnt->id == 0 && (mnt->op == OP_AND || mnt->op == OP_OR)) {
+    unsigned char idx = mnt->val_len;
+    mnt->val_len = 0;
+    mn = inorder_traverse(idx, offsets, mn, root, root + mnt->fi);
+    offsets[idx] = mn;
+    mn = copy_node(parent, mn, mnt);
+  } else {
+    mn = copy_node(parent, mn, mnt);
+  }
+  if (mnt->id == 0 && (mnt->op == OP_AND || mnt->op == OP_OR)) {
+    mn = inorder_traverse(parent, offsets, mn, root, root + mnt->ai);
+  }
+  return mn;
+}
+
+
+static size_t get_matcher_bytes(match_node_tmp nodes[], size_t size)
+{
+  size_t len = 0;
+  for (unsigned i = 0; i < size; ++i) {
+    size_t val_len = 0;
+    switch (nodes[i].val_type) {
+    case TYPE_STRING:
+      val_len = nodes[i].val_len + 1;
+      break;
+    case TYPE_NUMERIC:
+      val_len = sizeof(double);
+      break;
+    default:
+      break;
+    }
+
+    size_t var_len = 0;
+    if (nodes[i].id == LSB_PB_FIELDS) {
+      var_len = nodes[i].var_len;
+    }
+
+    len += (sizeof(match_node) * 2 + val_len + var_len - 1)
+      / sizeof(match_node) * sizeof(match_node);
+
+    if (nodes[i].op == OP_OR || nodes[i].op == OP_AND) {
+      // squirrel away the position for the short-circuit calculation
+      nodes[i].val_len = i;
+    }
+  }
+  return len;
+}
+
+
+static void make_tree(match_node_tmp nodes[], size_t size)
+{
+  // turn the postfix stack into a traversable tree
+  match_node_tmp *stack[size];
+  memset(stack, 0, sizeof(stack));
+  int top = 0;
+  for (unsigned i = 0; i < size; ++i) {
+    if (nodes[i].op != OP_AND && nodes[i].op != OP_OR) {
+      stack[top++] = &nodes[i];
+    } else {
+      nodes[i].ai = stack[--top] - nodes;
+      nodes[i].fi = stack[--top] - nodes;
+      stack[top++] = &nodes[i];
+    }
+  }
+}
+
+
+static lsb_message_matcher* make_matcher(match_node_tmp nodes[], size_t size)
+{
+  lsb_message_matcher *mm = malloc(sizeof(lsb_message_matcher));
+  if (!mm) { return NULL; }
+
+  mm->bytes = get_matcher_bytes(nodes, size);
+  mm->nodes = calloc(mm->bytes, 1);
+  if (!mm->nodes) {
+    free(mm);
+    return NULL;
+  }
+
+  match_node *offsets[size];
+  memset(offsets, 0, sizeof(offsets));
+
+  inorder_traverse(size, offsets, mm->nodes, nodes, nodes + (size - 1));
+
+  // populate the short-circuit offsets
+  match_node *e = mm->nodes + (mm->bytes / sizeof(match_node));
+  for (match_node *p = mm->nodes; p < e;){
+    if (p->op == OP_AND || p->op == OP_OR) {
+      if (p->u.off < size) {
+        p->u.off = offsets[p->u.off] - mm->nodes;
+      } else {
+        p->u.off =  mm->bytes / sizeof(match_node);
+      }
+    }
+    p += p->units;
+  }
+  return mm;
+}
+
+
+lsb_message_matcher* lsb_create_message_matcher(const char *exp)
+{
+  if (!exp) { return NULL; }
+
+  lsb_message_matcher *mm = NULL;
+  yycontext yy;
+  memset(&yy, 0, sizeof(yy));
+  yy.ctx.is.s = exp;
+  yy.ctx.is.size = strlen(exp);
+  int ret = yyparse(&yy);
+  if (ret) {
+    make_tree(yy.ctx.out.a, yy.ctx.out.pos);
+    mm = make_matcher(yy.ctx.out.a, yy.ctx.out.pos);
+  }
+  free(yy.ctx.out.a);
+  free(yy.ctx.ops.a);
+  yyrelease(&yy);
+  return mm;
+}

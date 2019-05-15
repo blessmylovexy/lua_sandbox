@@ -1,0 +1,28 @@
+/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* vim: set ts=2 et sw=2 tw=80: */
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+/** @brief Unit test setup @file */
+
+#ifndef test_h_
+#define test_h_
+
+#include "luasandbox/test/mu_test.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TEST_LUA_PATH "${CMAKE_SOURCE_DIR}/modules/?.lua"
+#define TEST_BASE_CPATH "${CMAKE_BINARY_DIR}/ep_base/inst/lib/luasandbox/"
+
+#ifdef _WIN32
+#define TEST_LUA_CPATH TEST_BASE_CPATH "modules/?.dll;" TEST_BASE_CPATH "io_modules/?.dll"
+#else
+#define TEST_LUA_CPATH TEST_BASE_CPATH "modules/?.so;" TEST_BASE_CPATH "io_modules/?.so"
+#endif
+
+#endif
